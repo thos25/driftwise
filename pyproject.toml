@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "driftwise"
+version = "0.1.0"
+description = "Detect drift between Terraform state and live Azure infrastructure"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = [
+    "typer[all]>=0.12.0",
+    "rich>=13.7.0",
+    "azure-identity>=1.16.0",
+    "azure-mgmt-resource>=23.0.0",
+    "azure-mgmt-costmanagement>=4.0.0",
+    "openai>=1.30.0",
+    "anthropic>=0.28.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2.0",
+    "pyinstaller>=6.0",   # for building a standalone .exe / binary
+]
+
+[project.scripts]
+driftwise = "cli.main:app"
+
+[tool.setuptools.packages.find]
+include = ["backend*", "cli*"]

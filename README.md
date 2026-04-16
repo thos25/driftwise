@@ -6,7 +6,7 @@ Detect drift between your Terraform state and live Azure infrastructure.
 driftwise compare ./terraform.tfstate
 ```
 
-DriftWise connects to Azure, compares your state file against what's actually running, and tells you what's been added, deleted, or modified outside of Terraform. Optionally enriches results with AI triage and month-to-date cost data.
+DriftWise connects to Azure, compares your Terraform state against what's actually running, and tells you what's been added, deleted, or modified outside of Terraform. Works with local state files or reads directly from Azure Blob Storage — nothing written to disk. Optionally enriches results with AI triage and month-to-date cost data.
 
 ---
 
@@ -55,11 +55,12 @@ export AZURE_TENANT_ID=...
 ## Usage
 
 ```
-driftwise compare STATE_FILE [OPTIONS]
+driftwise compare [STATE_FILE] [OPTIONS]
 ```
 
 | Option | Description |
 |---|---|
+| `--backend-config PATH` | Read state from Azure Blob Storage using a `backends.tfvars` file. |
 | `--subscription ID` | Azure subscription ID. Falls back to `AZURE_SUBSCRIPTION_ID` env var. |
 | `--all` | Also list resources that match (no drift). |
 | `--costs` | Show month-to-date spend from Azure Cost Management alongside each resource. |
@@ -71,8 +72,11 @@ driftwise compare STATE_FILE [OPTIONS]
 ### Examples
 
 ```bash
-# Basic drift check
+# Local state file
 driftwise compare ./terraform.tfstate
+
+# Remote state via backends.tfvars (reads directly from Azure Blob — nothing written to disk)
+driftwise compare --backend-config ./backends.tfvars
 
 # Specify subscription explicitly
 driftwise compare ./terraform.tfstate --subscription 00000000-0000-0000-0000-000000000000
@@ -81,7 +85,7 @@ driftwise compare ./terraform.tfstate --subscription 00000000-0000-0000-0000-000
 driftwise compare ./terraform.tfstate --all
 
 # Show drift + MTD cost data
-driftwise compare ./terraform.tfstate --costs
+driftwise compare --backend-config ./backends.tfvars --costs
 
 # Suppress specific resources inline
 driftwise compare ./terraform.tfstate --ignore "NetworkWatcherRG,cloud-shell-*"
@@ -102,6 +106,27 @@ driftwise compare ./terraform.tfstate --json | jq '.drift[]'
 | `2` | Drift detected |
 
 Exit code `2` lets you gate CI/CD pipelines on drift — fail a pipeline if infrastructure has changed outside of Terraform.
+
+---
+
+## Remote state (Azure Blob Storage)
+
+Enterprises rarely have state files locally. DriftWise can read state directly from Azure Blob Storage using the same `backends.tfvars` file you already use with Terraform — nothing is written to disk.
+
+```bash
+driftwise compare --backend-config ./backends.tfvars
+```
+
+Your `backends.tfvars` should contain:
+
+```hcl
+resource_group_name  = "my-tfstate-rg"
+storage_account_name = "mystorageacct"
+container_name       = "tfstate"
+key                  = "prod/terraform.tfstate"
+```
+
+Auth uses `DefaultAzureCredential` — the same credential chain as the rest of the tool, so `az login` or a service principal covers it automatically. All other flags (`--costs`, `--ignore`, `--json`, etc.) work the same way regardless of whether state comes from a local file or blob storage.
 
 ---
 
@@ -176,7 +201,11 @@ Only attributes that Azure returns via the resource list API are compared — at
     AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
     AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
   run: |
+    # Local state file
     driftwise compare ./terraform.tfstate
+
+    # Or read directly from Azure Blob Storage — no state file download needed
+    driftwise compare --backend-config ./backends.tfvars
   # exits 2 if drift found — fails the pipeline
 ```
 

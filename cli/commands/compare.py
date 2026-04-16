@@ -1,8 +1,10 @@
 """
 driftwise compare <state-file> [--subscription <id>]
+driftwise compare --backend-config <backends.tfvars>
 
-Loads a Terraform state file, fetches live Azure resources, runs the drift
-engine, optionally enriches results with AI triage, and prints a report.
+Loads a Terraform state file (local or from Azure Blob Storage), fetches live
+Azure resources, runs the drift engine, optionally enriches results with AI
+triage, and prints a report.
 """
 from __future__ import annotations
 
@@ -21,6 +23,7 @@ from backend.drift.engine import detect_drift, DriftItem
 from backend.ai.triage import triage_available, triage_drift, TriageResult
 from backend.costs.azure_costs import get_current_spend, SubscriptionCost
 from backend.ignore import load_ignore_file, rules_from_patterns, apply_ignores, IgnoreFileError
+from backend.remote.azure_blob import parse_backend_config, fetch_state, BackendConfigError, BlobFetchError
 
 console = Console()
 err = Console(stderr=True, style="bold red")
@@ -34,11 +37,9 @@ _RISK_COLORS = {
 
 
 def compare(
-    state_file: Path = typer.Argument(
-        ...,
-        help="Path to terraform.tfstate",
-        exists=True,
-        readable=True,
+    state_file: Optional[Path] = typer.Argument(
+        None,
+        help="Path to terraform.tfstate. Omit when using --backend-config.",
     ),
     subscription: Optional[str] = typer.Option(
         None,
@@ -75,6 +76,11 @@ def compare(
         "--ignore",
         help="Comma-separated resource name patterns to suppress (e.g. 'NetworkWatcher*,cloud-shell-*').",
     ),
+    backend_config: Optional[Path] = typer.Option(
+        None,
+        "--backend-config",
+        help="Path to a backends.tfvars file. Reads state directly from Azure Blob Storage.",
+    ),
 ) -> None:
     """
     Compare a Terraform state file against live Azure infrastructure.
@@ -83,15 +89,38 @@ def compare(
     Examples:
       driftwise compare ./terraform.tfstate
       driftwise compare ./terraform.tfstate --subscription 12345678-...
+      driftwise compare --backend-config ./backends.tfvars
       driftwise compare ./terraform.tfstate --json | jq '.drift[]'
     """
 
     # ── 1. Load and parse state file ──────────────────────────────────────────
-    try:
-        raw_state = load_state(state_file)
-    except StateParseError as exc:
-        err.print(f"[ERROR] Could not parse state file: {exc}")
+    if backend_config and state_file:
+        err.print("[ERROR] Provide either a state file or --backend-config, not both.")
         raise typer.Exit(1)
+
+    if not backend_config and not state_file:
+        err.print("[ERROR] Provide a state file path or --backend-config.")
+        raise typer.Exit(1)
+
+    if backend_config:
+        with console.status("[bold cyan]Fetching state from Azure Blob Storage...[/]"):
+            try:
+                config = parse_backend_config(backend_config)
+                raw_state = fetch_state(config)
+            except (BackendConfigError, BlobFetchError) as exc:
+                err.print(f"[ERROR] {exc}")
+                raise typer.Exit(1)
+        state_label = Path(config.key).name
+    else:
+        if not state_file.exists():
+            err.print(f"[ERROR] State file not found: {state_file}")
+            raise typer.Exit(1)
+        try:
+            raw_state = load_state(state_file)
+        except StateParseError as exc:
+            err.print(f"[ERROR] Could not parse state file: {exc}")
+            raise typer.Exit(1)
+        state_label = state_file
 
     state_resources = extract_resources(raw_state)
 
@@ -165,7 +194,7 @@ def compare(
             and r["azure_id"] in {lr["azure_id"] for lr in live_resources if lr.get("azure_id")}
         ]
         _print_report(
-            state_file, subscription,
+            state_label, subscription,
             state_resources, live_resources,
             drift_items, triage_results, cost_data,
             clean_resources=clean_resources if show_all else [],

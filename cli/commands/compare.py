@@ -227,7 +227,8 @@ def _print_report(
     console.print()
     console.print(Panel.fit("[bold]DriftWise — Drift Report[/]", border_style="cyan"))
     console.print()
-    console.print(f"  [dim]State file   :[/]  {state_file.resolve()}")
+    state_display = state_file.resolve() if isinstance(state_file, Path) else state_file
+    console.print(f"  [dim]State file   :[/]  {state_display}")
     if subscription:
         console.print(f"  [dim]Subscription :[/]  {subscription}")
     console.print(f"  [dim]Resources    :[/]  {len(state_resources)} in state · {len(live_resources)} live")

@@ -2,6 +2,11 @@
 .env
 *.tfstate
 *.tfstate.backup
+terraform.tfvars
+
+# Terraform working directory
+.terraform/
+.terraform.lock.hcl
 
 # Python
 __pycache__/

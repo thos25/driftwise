@@ -19,6 +19,7 @@ from backend.drift.parser import load_state, extract_resources, StateParseError
 from backend.drift.azure_fetcher import get_live_resources
 from backend.drift.engine import detect_drift, DriftItem
 from backend.ai.triage import triage_available, triage_drift, TriageResult
+from backend.costs.azure_costs import get_current_spend, SubscriptionCost
 
 console = Console()
 err = Console(stderr=True, style="bold red")
@@ -47,6 +48,16 @@ def compare(
         False,
         "--json",
         help="Output results as JSON (useful for CI/CD pipelines).",
+    ),
+    costs: bool = typer.Option(
+        False,
+        "--costs",
+        help="Fetch month-to-date spend from Azure Cost Management and show alongside drift.",
+    ),
+    show_all: bool = typer.Option(
+        False,
+        "--all",
+        help="Also list resources that match (no drift).",
     ),
 ) -> None:
     """
@@ -93,14 +104,35 @@ def compare(
         with console.status("[bold cyan]Running AI triage...[/]"):
             triage_results = triage_drift(drift_items)
 
-    # ── 5. Output ─────────────────────────────────────────────────────────────
+    # ── 5. Optional: cost data ────────────────────────────────────────────────
+    cost_data: SubscriptionCost | None = None
+    if costs:
+        with console.status("[bold cyan]Fetching cost data from Azure...[/]"):
+            try:
+                cost_data = get_current_spend(subscription)
+            except ValueError as exc:
+                err.print(f"[ERROR] {exc}")
+                raise typer.Exit(1)
+            except Exception as exc:
+                err.print(f"[WARN] Could not fetch cost data: {exc}")
+                err.print("Cost data will be omitted from the report.")
+                # Non-fatal — continue without costs
+
+    # ── 6. Output ─────────────────────────────────────────────────────────────
     if json_out:
-        _print_json(state_resources, live_resources, drift_items, triage_results)
+        _print_json(state_resources, live_resources, drift_items, triage_results, cost_data)
     else:
+        drifted_ids = {d.resource_id for d in drift_items if d.drift_type in ("deleted", "modified")}
+        clean_resources = [
+            r for r in state_resources
+            if r.get("azure_id") and r["azure_id"] not in drifted_ids
+            and r["azure_id"] in {lr["azure_id"] for lr in live_resources if lr.get("azure_id")}
+        ]
         _print_report(
             state_file, subscription,
             state_resources, live_resources,
-            drift_items, triage_results,
+            drift_items, triage_results, cost_data,
+            clean_resources=clean_resources if show_all else [],
         )
 
     # Exit 2 when drift found — lets CI pipelines gate on this cleanly
@@ -117,6 +149,8 @@ def _print_report(
     live_resources: list,
     drift_items: list[DriftItem],
     triage_results: dict[str, TriageResult],
+    cost_data: Optional[SubscriptionCost] = None,
+    clean_resources: list | None = None,
 ) -> None:
     deleted  = [d for d in drift_items if d.drift_type == "deleted"]
     added    = [d for d in drift_items if d.drift_type == "added"]
@@ -130,6 +164,12 @@ def _print_report(
     if subscription:
         console.print(f"  [dim]Subscription :[/]  {subscription}")
     console.print(f"  [dim]Resources    :[/]  {len(state_resources)} in state · {len(live_resources)} live")
+    if cost_data is not None:
+        console.print(
+            f"  [dim]Cost (MTD)   :[/]  "
+            f"[bold]{cost_data.total:,.2f} {cost_data.currency}[/]  "
+            f"[dim]({cost_data.billing_period})[/]"
+        )
     console.print()
 
     if not drift_items:
@@ -149,12 +189,14 @@ def _print_report(
     console.print()
 
     # Per-item detail sections
+    if clean_resources:
+        _print_clean_section(clean_resources, cost_data)
     if deleted:
-        _print_section("Deleted", deleted, "✗", "red", triage_results)
+        _print_section("Deleted", deleted, "✗", "red", triage_results, cost_data)
     if modified:
-        _print_section("Modified", modified, "~", "yellow", triage_results)
+        _print_section("Modified", modified, "~", "yellow", triage_results, cost_data)
     if added:
-        _print_section("Added", added, "+", "blue", triage_results)
+        _print_section("Added", added, "+", "blue", triage_results, cost_data)
 
     # Tip when no LLM key is configured
     if not triage_available():
@@ -164,17 +206,37 @@ def _print_report(
         console.print()
 
 
+def _print_clean_section(
+    resources: list[dict],
+    cost_data: Optional[SubscriptionCost] = None,
+) -> None:
+    console.rule("[bold green]Matching[/]", style="green")
+    console.print()
+    for r in resources:
+        rid = r.get("azure_id", "")
+        cost_str = ""
+        if cost_data is not None:
+            item_cost = cost_data.cost_for(rid)
+            if item_cost is not None:
+                cost_str = f"  [dim]{item_cost:,.2f} {cost_data.currency} MTD[/]"
+        console.print(f"  [green]✓[/]  [bold]{r.get('type', '')}[/]  \"{r.get('name', '')}\"{cost_str}")
+        console.print(f"     [dim]{_shorten_id(rid)}[/]")
+        console.print()
+    console.print()
+
+
 def _print_section(
     title: str,
     items: list[DriftItem],
     icon: str,
     style: str,
     triage_results: dict[str, TriageResult],
+    cost_data: Optional[SubscriptionCost] = None,
 ) -> None:
     console.rule(f"[bold {style}]{title}[/]", style=style)
     console.print()
     for item in items:
-        _print_item(item, icon, style, triage_results.get(item.resource_id))
+        _print_item(item, icon, style, triage_results.get(item.resource_id), cost_data)
     console.print()
 
 
@@ -183,8 +245,15 @@ def _print_item(
     icon: str,
     style: str,
     triage: Optional[TriageResult],
+    cost_data: Optional[SubscriptionCost] = None,
 ) -> None:
-    console.print(f"  [{style}]{icon}[/]  [bold]{item.resource_type}[/]  \"{item.resource_name}\"")
+    cost_str = ""
+    if cost_data is not None:
+        item_cost = cost_data.cost_for(item.resource_id)
+        if item_cost is not None:
+            cost_str = f"  [dim]{item_cost:,.2f} {cost_data.currency} MTD[/]"
+
+    console.print(f"  [{style}]{icon}[/]  [bold]{item.resource_type}[/]  \"{item.resource_name}\"{cost_str}")
     if item.changed_fields:
         console.print(f"     [dim]Changed:[/] {', '.join(item.changed_fields)}")
     console.print(f"     [dim]{_shorten_id(item.resource_id)}[/]")
@@ -217,8 +286,9 @@ def _print_json(
     live_resources: list,
     drift_items: list[DriftItem],
     triage_results: dict[str, TriageResult],
+    cost_data: Optional[SubscriptionCost] = None,
 ) -> None:
-    output = {
+    output: dict = {
         "state_count": len(state_resources),
         "live_count": len(live_resources),
         "drift_count": len(drift_items),
@@ -230,10 +300,27 @@ def _print_json(
                 "resource_id": d.resource_id,
                 "changed_fields": d.changed_fields,
                 "triage": _triage_to_dict(triage_results.get(d.resource_id)),
+                "cost_mtd": (cost_data.cost_for(d.resource_id) if cost_data else None),
             }
             for d in drift_items
         ],
     }
+    if cost_data is not None:
+        output["costs"] = {
+            "billing_period": cost_data.billing_period,
+            "total": cost_data.total,
+            "currency": cost_data.currency,
+            "by_resource": [
+                {
+                    "resource_id": e.resource_id,
+                    "resource_type": e.resource_type,
+                    "resource_group": e.resource_group,
+                    "cost": e.cost,
+                    "currency": e.currency,
+                }
+                for e in cost_data.entries
+            ],
+        }
     print(json.dumps(output, indent=2))
 
 

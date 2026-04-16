@@ -5,15 +5,18 @@ All Azure SDK calls are mocked — no real Azure credentials required.
 """
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
 from backend.drift.azure_fetcher import (
     get_live_resources,
+    get_live_resources_multi,
     _normalise_resource,
     _normalise_resource_group,
     _map_azure_type,
+    _parse_subscription_id,
+    _parse_provider_info,
 )
 
 SUB_ID = "12345678-1234-1234-1234-123456789abc"
@@ -74,7 +77,12 @@ def mock_client():
 
 @pytest.fixture()
 def live_resources(mock_client):
-    with patch("backend.drift.azure_fetcher._build_client", return_value=mock_client):
+    with patch("backend.drift.azure_fetcher._fetch_subscription", return_value=[
+        _normalise_resource_group(_mock_rg()),
+        _normalise_resource(_mock_resource(SA_ID, "demosa", "Microsoft.Storage/storageAccounts",
+                                            kind="StorageV2", sku_name="Standard_LRS", sku_tier="Standard")),
+        _normalise_resource(_mock_resource(VNET_ID, "demo-vnet", "Microsoft.Network/virtualNetworks")),
+    ]):
         return get_live_resources(SUB_ID)
 
 
@@ -108,11 +116,13 @@ def test_no_subscription_id_raises(monkeypatch):
         get_live_resources()
 
 
-def test_subscription_id_from_env(monkeypatch, mock_client):
+def test_subscription_id_from_env(monkeypatch):
     monkeypatch.setenv("AZURE_SUBSCRIPTION_ID", SUB_ID)
-    with patch("backend.drift.azure_fetcher._build_client", return_value=mock_client) as build:
-        get_live_resources()  # no explicit sub_id
-        build.assert_called_once_with(SUB_ID)
+    primary_resources = [_normalise_resource_group(_mock_rg())]
+    with patch("backend.drift.azure_fetcher._fetch_subscription", return_value=primary_resources):
+        with patch("backend.drift.azure_fetcher.DefaultAzureCredential"):
+            result = get_live_resources()
+            assert isinstance(result, list)
 
 
 # ── resource shape ────────────────────────────────────────────────────────────
@@ -208,3 +218,80 @@ def test_map_azure_type_unknown_fallback():
 def test_map_azure_type_case_insensitive():
     assert _map_azure_type("microsoft.storage/storageaccounts") == "azurerm_storage_account"
     assert _map_azure_type("MICROSOFT.STORAGE/STORAGEACCOUNTS") == "azurerm_storage_account"
+
+
+# ── _parse_subscription_id ────────────────────────────────────────────────────
+
+OTHER_SUB = "99999999-9999-9999-9999-999999999999"
+KV_ID = f"/subscriptions/{OTHER_SUB}/resourceGroups/shared-rg/providers/Microsoft.KeyVault/vaults/my-vault"
+KV_SECRET_ID = f"/subscriptions/{OTHER_SUB}/resourceGroups/shared-rg/providers/Microsoft.KeyVault/vaults/my-vault/secrets/my-secret"
+
+
+def test_parse_subscription_id_standard():
+    assert _parse_subscription_id(SA_ID) == SUB_ID.lower()
+
+
+def test_parse_subscription_id_cross_sub():
+    assert _parse_subscription_id(KV_ID) == OTHER_SUB.lower()
+
+
+def test_parse_subscription_id_no_match():
+    assert _parse_subscription_id("not-a-resource-id") is None
+
+
+# ── _parse_provider_info ──────────────────────────────────────────────────────
+
+def test_parse_provider_info_simple():
+    ns, rt = _parse_provider_info(SA_ID)
+    assert ns == "Microsoft.Storage"
+    assert rt == "storageAccounts"
+
+
+def test_parse_provider_info_sub_resource():
+    ns, rt = _parse_provider_info(KV_SECRET_ID)
+    assert ns == "Microsoft.KeyVault"
+    assert rt == "vaults/secrets"
+
+
+def test_parse_provider_info_resource_group():
+    ns, rt = _parse_provider_info(RG_ID)
+    assert ns == "Microsoft.Resources"
+    assert rt == "resourceGroups"
+
+
+# ── get_live_resources_multi ──────────────────────────────────────────────────
+
+def test_multi_fetches_cross_sub_by_id(monkeypatch):
+    """Resources in a different subscription are looked up individually."""
+    cross_sub_state = [
+        {"azure_id": KV_ID.lower(), "type": "azurerm_key_vault", "name": "my-vault"},
+    ]
+    primary_result = [_normalise_resource_group(_mock_rg())]
+    kv_result = _normalise_resource(_mock_resource(KV_ID, "my-vault", "Microsoft.KeyVault/vaults"))
+
+    with patch("backend.drift.azure_fetcher.DefaultAzureCredential"):
+        with patch("backend.drift.azure_fetcher._fetch_subscription", return_value=primary_result):
+            with patch("backend.drift.azure_fetcher._get_resource_by_id", return_value=kv_result) as mock_get:
+                result = get_live_resources_multi(SUB_ID, cross_sub_state)
+
+    mock_get.assert_called_once_with(KV_ID.lower(), ANY)
+    assert len(result) == 2  # 1 primary + 1 cross-sub
+
+
+def test_multi_skips_cross_sub_already_in_primary(monkeypatch):
+    """If a cross-sub resource is already in the primary results, don't fetch it again."""
+    kv_item = _normalise_resource(_mock_resource(KV_ID, "my-vault", "Microsoft.KeyVault/vaults"))
+    cross_sub_state = [{"azure_id": KV_ID.lower()}]
+
+    with patch("backend.drift.azure_fetcher.DefaultAzureCredential"):
+        with patch("backend.drift.azure_fetcher._fetch_subscription", return_value=[kv_item]):
+            with patch("backend.drift.azure_fetcher._get_resource_by_id") as mock_get:
+                get_live_resources_multi(SUB_ID, cross_sub_state)
+
+    mock_get.assert_not_called()
+
+
+def test_multi_no_subscription_raises(monkeypatch):
+    monkeypatch.delenv("AZURE_SUBSCRIPTION_ID", raising=False)
+    with pytest.raises(ValueError, match="No subscription ID"):
+        get_live_resources_multi(None, [])

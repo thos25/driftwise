@@ -18,7 +18,7 @@ from rich.padding import Padding
 from rich.panel import Panel
 
 from backend.drift.parser import load_state, extract_resources, StateParseError
-from backend.drift.azure_fetcher import get_live_resources
+from backend.drift.azure_fetcher import get_live_resources_multi
 from backend.drift.engine import detect_drift, DriftItem
 from backend.ai.triage import triage_available, triage_drift, TriageResult
 from backend.costs.azure_costs import get_current_spend, SubscriptionCost
@@ -132,7 +132,7 @@ def compare(
     # ── 2. Fetch live Azure resources ─────────────────────────────────────────
     with console.status("[bold cyan]Fetching live resources from Azure...[/]"):
         try:
-            live_resources = get_live_resources(subscription)
+            live_resources = get_live_resources_multi(subscription, state_resources)
         except ValueError as exc:
             err.print(f"[ERROR] {exc}")
             raise typer.Exit(1)

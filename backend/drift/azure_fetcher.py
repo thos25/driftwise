@@ -3,6 +3,13 @@ Azure live resource fetcher.
 Reads all managed resources from an Azure subscription and returns them
 in the same normalised format as backend.drift.parser.extract_resources().
 
+Cross-subscription support:
+  get_live_resources_multi() inspects each resource ID in the state file to
+  determine which subscription it belongs to. Resources in the primary
+  subscription are fetched via a full list (existing behaviour). Resources in
+  other subscriptions are looked up individually by resource ID — avoiding
+  noise from unrelated resources in shared subscriptions.
+
 Note on attribute coverage:
   Azure's generic resources.list() API returns a limited set of attributes
   (location, tags, kind, sku). Resource-specific APIs (e.g. the Storage or
@@ -12,6 +19,7 @@ Note on attribute coverage:
 from __future__ import annotations
 
 import os
+import re
 from typing import Any
 
 from azure.identity import DefaultAzureCredential
@@ -68,16 +76,77 @@ def get_live_resources(subscription_id: str | None = None) -> list[dict[str, Any
             "Pass one explicitly or set the AZURE_SUBSCRIPTION_ID environment variable."
         )
 
-    client = _build_client(sub_id)
+    credential = DefaultAzureCredential()
+    return _fetch_subscription(sub_id, credential)
+
+
+def get_live_resources_multi(
+    primary_subscription: str | None,
+    state_resources: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Fetch live resources, handling cross-subscription state automatically.
+
+    - Primary subscription: full list fetch (same as get_live_resources).
+    - Any other subscription found in state resource IDs: individual get-by-ID
+      lookup, so unrelated resources in shared subscriptions are never fetched.
+
+    Args:
+        primary_subscription: the subscription to do a full list fetch on.
+            Falls back to AZURE_SUBSCRIPTION_ID env var.
+        state_resources: the parsed resources from the state file — used to
+            discover cross-subscription resource IDs.
+
+    Returns:
+        Combined list of normalised resource dicts from all subscriptions.
+    """
+    primary_sub = primary_subscription or os.getenv("AZURE_SUBSCRIPTION_ID")
+    if not primary_sub:
+        raise ValueError(
+            "No subscription ID provided. "
+            "Pass one explicitly or set the AZURE_SUBSCRIPTION_ID environment variable."
+        )
+
+    credential = DefaultAzureCredential()
+
+    # Full fetch for the primary subscription
+    live: list[dict[str, Any]] = _fetch_subscription(primary_sub, credential)
+
+    # Find any state resource IDs that belong to a different subscription
+    primary_lower = primary_sub.lower()
+    cross_sub_ids = [
+        r["azure_id"]
+        for r in state_resources
+        if r.get("azure_id")
+        and _parse_subscription_id(r["azure_id"]) not in (None, primary_lower)
+    ]
+
+    if cross_sub_ids:
+        seen: set[str] = {r["azure_id"] for r in live}
+        for resource_id in cross_sub_ids:
+            if resource_id in seen:
+                continue
+            item = _get_resource_by_id(resource_id, credential)
+            if item:
+                live.append(item)
+                seen.add(resource_id)
+
+    return live
+
+
+def _fetch_subscription(
+    subscription_id: str,
+    credential: DefaultAzureCredential,
+) -> list[dict[str, Any]]:
+    """Full list fetch for a single subscription (existing behaviour)."""
+    client = ResourceManagementClient(credential, subscription_id)
     resources: list[dict[str, Any]] = []
 
-    # Resource groups are not returned by resources.list() — fetch separately.
     for rg in client.resource_groups.list():
         item = _normalise_resource_group(rg)
         if item:
             resources.append(item)
 
-    # All other resource types in the subscription.
     for resource in client.resources.list(expand="properties"):
         item = _normalise_resource(resource)
         if item:
@@ -86,7 +155,117 @@ def get_live_resources(subscription_id: str | None = None) -> list[dict[str, Any
     return resources
 
 
+def _get_resource_by_id(
+    resource_id: str,
+    credential: DefaultAzureCredential,
+) -> dict[str, Any] | None:
+    """
+    Look up a single resource by its full Azure resource ID.
+
+    Used for cross-subscription resources — avoids fetching unrelated
+    resources from shared subscriptions.
+    """
+    sub_id = _parse_subscription_id(resource_id)
+    if not sub_id:
+        return None
+
+    provider_info = _parse_provider_info(resource_id)
+    if not provider_info:
+        return None
+
+    namespace, resource_type = provider_info
+    client = ResourceManagementClient(credential, sub_id)
+
+    try:
+        api_version = _resolve_api_version(namespace, resource_type, client)
+        resource = client.resources.get_by_id(resource_id, api_version)
+        return _normalise_resource(resource)
+    except Exception:
+        return None
+
+
 # ── Internal helpers ─────────────────────────────────────────────────────────
+
+# Cache: (namespace, resource_type) → api_version string
+_API_VERSION_CACHE: dict[tuple[str, str], str] = {}
+
+_FALLBACK_API_VERSION = "2021-04-01"
+
+# Regex to extract subscription ID from a resource ID
+_SUB_RE = re.compile(r"^/subscriptions/([^/]+)", re.IGNORECASE)
+
+
+def _parse_subscription_id(resource_id: str) -> str | None:
+    """Extract and return the lowercased subscription GUID from a resource ID."""
+    match = _SUB_RE.match(resource_id)
+    return match.group(1).lower() if match else None
+
+
+def _parse_provider_info(resource_id: str) -> tuple[str, str] | None:
+    """
+    Extract the provider namespace and resource type from a resource ID.
+
+    Examples:
+      .../providers/Microsoft.KeyVault/vaults/my-vault
+        → ("Microsoft.KeyVault", "vaults")
+      .../providers/Microsoft.KeyVault/vaults/my-vault/secrets/my-secret
+        → ("Microsoft.KeyVault", "vaults/secrets")
+      .../resourceGroups/my-rg  (no providers segment)
+        → ("Microsoft.Resources", "resourceGroups")
+    """
+    parts = resource_id.split("/")
+    try:
+        idx = next(i for i, p in enumerate(parts) if p.lower() == "providers")
+    except StopIteration:
+        # Resource group ID — no providers segment
+        if any(p.lower() == "resourcegroups" for p in parts):
+            return ("Microsoft.Resources", "resourceGroups")
+        return None
+
+    namespace = parts[idx + 1]
+    # Resource type: alternating type/name pairs after namespace
+    # e.g. vaults/my-vault/secrets/my-secret → type = "vaults/secrets"
+    remainder = parts[idx + 2:]  # [type, name, subtype, subname, ...]
+    type_parts = [remainder[i] for i in range(0, len(remainder), 2)]
+    resource_type = "/".join(type_parts)
+
+    return (namespace, resource_type)
+
+
+def _resolve_api_version(
+    namespace: str,
+    resource_type: str,
+    client: ResourceManagementClient,
+) -> str:
+    """
+    Return the latest stable API version for a resource type.
+
+    Results are cached per (namespace, resource_type) to avoid repeated
+    provider calls for the same type within a single run.
+    """
+    cache_key = (namespace.lower(), resource_type.lower())
+    if cache_key in _API_VERSION_CACHE:
+        return _API_VERSION_CACHE[cache_key]
+
+    try:
+        provider = client.providers.get(namespace)
+        for rt in (provider.resource_types or []):
+            if rt.resource_type.lower() == resource_type.lower():
+                versions = [
+                    v for v in (rt.api_versions or [])
+                    if "preview" not in v.lower()
+                ]
+                if not versions:
+                    versions = rt.api_versions or []
+                version = sorted(versions, reverse=True)[0] if versions else _FALLBACK_API_VERSION
+                _API_VERSION_CACHE[cache_key] = version
+                return version
+    except Exception:
+        pass
+
+    _API_VERSION_CACHE[cache_key] = _FALLBACK_API_VERSION
+    return _FALLBACK_API_VERSION
+
 
 def _build_client(subscription_id: str) -> ResourceManagementClient:
     """Create an authenticated Azure Resource Management client.

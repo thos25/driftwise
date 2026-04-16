@@ -81,6 +81,11 @@ def compare(
         "--backend-config",
         help="Path to a backends.tfvars file. Reads state directly from Azure Blob Storage.",
     ),
+    no_ai: bool = typer.Option(
+        False,
+        "--no-ai",
+        help="Skip AI triage even if an API key is configured.",
+    ),
 ) -> None:
     """
     Compare a Terraform state file against live Azure infrastructure.
@@ -163,9 +168,9 @@ def compare(
         drift_items, suppressed = apply_ignores(drift_items, ignore_rules)
 
     # ── 5. Optional: AI triage ────────────────────────────────────────────────
-    # Runs only when an API key is present. A missing key is not an error.
+    # Runs only when an API key is present and --no-ai is not set.
     triage_results: dict[str, TriageResult] = {}
-    if drift_items and triage_available():
+    if drift_items and triage_available() and not no_ai:
         with console.status("[bold cyan]Running AI triage...[/]"):
             triage_results = triage_drift(drift_items, verbose=verbose)
 

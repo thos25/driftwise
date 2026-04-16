@@ -2,6 +2,9 @@
 .env
 *.tfstate
 *.tfstate.backup
+
+# Allow test fixtures
+!tests/fixtures/*.tfstate
 terraform.tfvars
 
 # Terraform working directory

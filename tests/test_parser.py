@@ -44,9 +44,16 @@ def test_load_state_invalid_json(tmp_path):
 
 def test_load_state_wrong_version(tmp_path):
     old = tmp_path / "old.tfstate"
-    old.write_text(json.dumps({"version": 3, "resources": []}), encoding="utf-8")
+    old.write_text(json.dumps({"version": 99, "resources": []}), encoding="utf-8")
     with pytest.raises(StateParseError, match="Unsupported state file version"):
         load_state(old)
+
+
+def test_load_state_v3_accepted(tmp_path):
+    v3 = tmp_path / "v3.tfstate"
+    v3.write_text(json.dumps({"version": 3, "modules": []}), encoding="utf-8")
+    state = load_state(v3)
+    assert state["version"] == 3
 
 
 # ── extract_resources ─────────────────────────────────────────────────────────

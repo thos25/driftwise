@@ -39,13 +39,14 @@ def triage_available() -> bool:
     return bool(os.getenv("ANTHROPIC_API_KEY") or os.getenv("OPENAI_API_KEY"))
 
 
-def triage_drift(drift_items: list[DriftItem]) -> dict[str, TriageResult]:
+def triage_drift(drift_items: list[DriftItem], verbose: bool = False) -> dict[str, TriageResult]:
     """
     Call the configured LLM for each drift item and return triage results.
 
     Returns a dict keyed by resource_id → TriageResult.
     Returns an empty dict if no API key is configured.
     A failed call for one item is silently skipped — it never aborts the report.
+    Pass verbose=True to print warnings when individual triage calls fail.
     """
     if not triage_available():
         return {}
@@ -54,7 +55,7 @@ def triage_drift(drift_items: list[DriftItem]) -> dict[str, TriageResult]:
     results: dict[str, TriageResult] = {}
 
     for item in drift_items:
-        result = _triage_one(item, provider)
+        result = _triage_one(item, provider, verbose=verbose)
         if result is not None:
             results[item.resource_id] = result
 
@@ -81,12 +82,15 @@ def _detect_provider() -> str:
     return "openai"
 
 
-def _triage_one(item: DriftItem, provider: str) -> TriageResult | None:
+def _triage_one(item: DriftItem, provider: str, verbose: bool = False) -> TriageResult | None:
     """Call the LLM for a single drift item. Returns None on any failure."""
     try:
         raw = _call_llm(_build_prompt(item), provider)
         return _parse_response(raw)
-    except Exception:
+    except Exception as exc:
+        if verbose:
+            import sys
+            print(f"[WARN] AI triage failed for {item.resource_name}: {exc}", file=sys.stderr)
         return None
 
 

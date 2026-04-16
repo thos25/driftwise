@@ -64,6 +64,9 @@ driftwise compare STATE_FILE [OPTIONS]
 | `--all` | Also list resources that match (no drift). |
 | `--costs` | Show month-to-date spend from Azure Cost Management alongside each resource. |
 | `--json` | Output results as JSON — useful for piping into other tools. |
+| `--verbose` / `-v` | Show warnings when optional steps fail (e.g. AI triage errors). |
+| `--ignore PATTERNS` | Comma-separated resource name patterns to suppress (e.g. `NetworkWatcher*,cloud-shell-*`). |
+| `--ignore-file PATH` | Path to a `.driftwise-ignore` YAML file. Defaults to `.driftwise-ignore` in the current directory. |
 
 ### Examples
 
@@ -80,6 +83,12 @@ driftwise compare ./terraform.tfstate --all
 # Show drift + MTD cost data
 driftwise compare ./terraform.tfstate --costs
 
+# Suppress specific resources inline
+driftwise compare ./terraform.tfstate --ignore "NetworkWatcherRG,cloud-shell-*"
+
+# Use a custom ignore file
+driftwise compare ./terraform.tfstate --ignore-file ./my-ignore.yaml
+
 # JSON output for scripting
 driftwise compare ./terraform.tfstate --json | jq '.drift[]'
 ```
@@ -93,6 +102,43 @@ driftwise compare ./terraform.tfstate --json | jq '.drift[]'
 | `2` | Drift detected |
 
 Exit code `2` lets you gate CI/CD pipelines on drift — fail a pipeline if infrastructure has changed outside of Terraform.
+
+---
+
+## Ignoring resources
+
+Some resources exist in every Azure subscription but aren't managed by Terraform — NetworkWatcher, Cloud Shell storage, etc. Use an ignore file to suppress them permanently, or `--ignore` for one-off runs.
+
+### `.driftwise-ignore` file
+
+Place a `.driftwise-ignore` file in the directory you run driftwise from:
+
+```yaml
+ignore:
+  # Exact name match
+  - name: "NetworkWatcherRG"
+
+  # Wildcard match
+  - name: "NetworkWatcher_*"
+  - name: "cloud-shell-*"
+
+  # Match by resource type
+  - type: "microsoft.network/networkwatchers"
+
+  # Only suppress when drift type is "added" (still report if deleted/modified)
+  - name: "my-unmanaged-rg"
+    drift_type: added
+```
+
+Supported match fields:
+
+| Field | Description |
+|---|---|
+| `name` | Resource name — supports `*` wildcards, case-insensitive |
+| `type` | Resource type (e.g. `microsoft.compute/virtualmachines`) — case-insensitive |
+| `drift_type` | Optional: `added`, `deleted`, or `modified`. If omitted, suppresses all drift types. |
+
+Suppressed resources are excluded from the report entirely. A footer note shows how many were suppressed so nothing is hidden silently.
 
 ---
 

@@ -20,6 +20,7 @@ from backend.drift.azure_fetcher import get_live_resources
 from backend.drift.engine import detect_drift, DriftItem
 from backend.ai.triage import triage_available, triage_drift, TriageResult
 from backend.costs.azure_costs import get_current_spend, SubscriptionCost
+from backend.ignore import load_ignore_file, rules_from_patterns, apply_ignores, IgnoreFileError
 
 console = Console()
 err = Console(stderr=True, style="bold red")
@@ -59,6 +60,21 @@ def compare(
         "--all",
         help="Also list resources that match (no drift).",
     ),
+    verbose: bool = typer.Option(
+        False,
+        "--verbose", "-v",
+        help="Show warnings when AI triage or other optional steps fail.",
+    ),
+    ignore_file: Optional[Path] = typer.Option(
+        None,
+        "--ignore-file",
+        help="Path to a .driftwise-ignore YAML file. Defaults to .driftwise-ignore in the current directory.",
+    ),
+    ignore_patterns: Optional[str] = typer.Option(
+        None,
+        "--ignore",
+        help="Comma-separated resource name patterns to suppress (e.g. 'NetworkWatcher*,cloud-shell-*').",
+    ),
 ) -> None:
     """
     Compare a Terraform state file against live Azure infrastructure.
@@ -97,12 +113,32 @@ def compare(
     # ── 3. Detect drift ────────────────────────────────────────────────────────
     drift_items = detect_drift(state_resources, live_resources)
 
-    # ── 4. Optional: AI triage ────────────────────────────────────────────────
+    # ── 4. Apply ignore rules ─────────────────────────────────────────────────
+    ignore_rules = []
+
+    # Load from file: explicit --ignore-file, or .driftwise-ignore in cwd
+    resolved_ignore_file = ignore_file or Path(".driftwise-ignore")
+    if resolved_ignore_file.exists():
+        try:
+            ignore_rules.extend(load_ignore_file(resolved_ignore_file))
+        except IgnoreFileError as exc:
+            err.print(f"[ERROR] {exc}")
+            raise typer.Exit(1)
+
+    # Add inline --ignore patterns
+    if ignore_patterns:
+        ignore_rules.extend(rules_from_patterns(ignore_patterns))
+
+    suppressed = 0
+    if ignore_rules:
+        drift_items, suppressed = apply_ignores(drift_items, ignore_rules)
+
+    # ── 5. Optional: AI triage ────────────────────────────────────────────────
     # Runs only when an API key is present. A missing key is not an error.
     triage_results: dict[str, TriageResult] = {}
     if drift_items and triage_available():
         with console.status("[bold cyan]Running AI triage...[/]"):
-            triage_results = triage_drift(drift_items)
+            triage_results = triage_drift(drift_items, verbose=verbose)
 
     # ── 5. Optional: cost data ────────────────────────────────────────────────
     cost_data: SubscriptionCost | None = None
@@ -133,6 +169,7 @@ def compare(
             state_resources, live_resources,
             drift_items, triage_results, cost_data,
             clean_resources=clean_resources if show_all else [],
+            suppressed=suppressed,
         )
 
     # Exit 2 when drift found — lets CI pipelines gate on this cleanly
@@ -151,6 +188,7 @@ def _print_report(
     triage_results: dict[str, TriageResult],
     cost_data: Optional[SubscriptionCost] = None,
     clean_resources: list | None = None,
+    suppressed: int = 0,
 ) -> None:
     deleted  = [d for d in drift_items if d.drift_type == "deleted"]
     added    = [d for d in drift_items if d.drift_type == "added"]
@@ -197,6 +235,13 @@ def _print_report(
         _print_section("Modified", modified, "~", "yellow", triage_results, cost_data)
     if added:
         _print_section("Added", added, "+", "blue", triage_results, cost_data)
+
+    # Suppression notice
+    if suppressed:
+        console.print(
+            f"  [dim]{suppressed} resource(s) suppressed by ignore rules.[/]"
+        )
+        console.print()
 
     # Tip when no LLM key is configured
     if not triage_available():

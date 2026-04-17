@@ -53,6 +53,15 @@ _AZURE_TO_TF_TYPE: dict[str, str] = {
 }
 
 
+# Resource types in Terraform that are not returned by the generic Resource
+# Management API. These must be filtered from state before drift detection to
+# avoid guaranteed false-positive "deleted" drift entries.
+_UNFETCHABLE_TF_TYPES: frozenset[str] = frozenset({
+    "azurerm_role_assignment",
+    "azurerm_role_definition",
+})
+
+
 def get_live_resources(subscription_id: str | None = None) -> list[dict[str, Any]]:
     """
     Fetch all managed resources from an Azure subscription.
@@ -83,7 +92,7 @@ def get_live_resources(subscription_id: str | None = None) -> list[dict[str, Any
 def get_live_resources_multi(
     primary_subscription: str | None,
     state_resources: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], list[str]]:
     """
     Fetch live resources, handling cross-subscription state automatically.
 
@@ -98,7 +107,9 @@ def get_live_resources_multi(
             discover cross-subscription resource IDs.
 
     Returns:
-        Combined list of normalised resource dicts from all subscriptions.
+        Tuple of (live_resources, warnings). Warnings are emitted when a
+        cross-subscription lookup fails — the resource is skipped rather than
+        silently treated as deleted drift.
     """
     primary_sub = primary_subscription or os.getenv("AZURE_SUBSCRIPTION_ID")
     if not primary_sub:
@@ -111,6 +122,7 @@ def get_live_resources_multi(
 
     # Full fetch for the primary subscription
     live: list[dict[str, Any]] = _fetch_subscription(primary_sub, credential)
+    warnings: list[str] = []
 
     # Find any state resource IDs that belong to a different subscription
     primary_lower = primary_sub.lower()
@@ -126,12 +138,35 @@ def get_live_resources_multi(
         for resource_id in cross_sub_ids:
             if resource_id in seen:
                 continue
-            item = _get_resource_by_id(resource_id, credential)
+            item, error = _get_resource_by_id(resource_id, credential)
             if item:
                 live.append(item)
                 seen.add(resource_id)
+            elif error:
+                warnings.append(
+                    f"Cross-subscription lookup failed for {resource_id}: {error} — skipped (resource excluded from drift check)"
+                )
 
-    return live
+    return live, warnings
+
+
+def filter_unsupported_state_resources(
+    state_resources: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """
+    Remove resource types that cannot be fetched via the Azure Resource Management API.
+
+    Returns (kept_resources, removed_counts_by_type). Callers should warn the
+    user about any removed types so drift results are not silently incomplete.
+    """
+    kept = []
+    removed: dict[str, int] = {}
+    for r in state_resources:
+        if r.get("type") in _UNFETCHABLE_TF_TYPES:
+            removed[r["type"]] = removed.get(r["type"], 0) + 1
+        else:
+            kept.append(r)
+    return kept, removed
 
 
 def _fetch_subscription(
@@ -158,20 +193,23 @@ def _fetch_subscription(
 def _get_resource_by_id(
     resource_id: str,
     credential: DefaultAzureCredential,
-) -> dict[str, Any] | None:
+) -> tuple[dict[str, Any] | None, str | None]:
     """
     Look up a single resource by its full Azure resource ID.
 
     Used for cross-subscription resources — avoids fetching unrelated
     resources from shared subscriptions.
+
+    Returns (resource_dict, None) on success, (None, error_message) on failure.
+    Never returns (None, None) — a missing resource returns (None, "not found").
     """
     sub_id = _parse_subscription_id(resource_id)
     if not sub_id:
-        return None
+        return None, f"could not parse subscription ID from resource ID"
 
     provider_info = _parse_provider_info(resource_id)
     if not provider_info:
-        return None
+        return None, f"could not parse provider info from resource ID"
 
     namespace, resource_type = provider_info
     client = ResourceManagementClient(credential, sub_id)
@@ -179,9 +217,9 @@ def _get_resource_by_id(
     try:
         api_version = _resolve_api_version(namespace, resource_type, client)
         resource = client.resources.get_by_id(resource_id, api_version)
-        return _normalise_resource(resource)
-    except Exception:
-        return None
+        return _normalise_resource(resource), None
+    except Exception as exc:
+        return None, str(exc)
 
 
 # ── Internal helpers ─────────────────────────────────────────────────────────

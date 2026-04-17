@@ -12,6 +12,7 @@ import pytest
 from backend.drift.azure_fetcher import (
     get_live_resources,
     get_live_resources_multi,
+    filter_unsupported_state_resources,
     _normalise_resource,
     _normalise_resource_group,
     _map_azure_type,
@@ -271,11 +272,12 @@ def test_multi_fetches_cross_sub_by_id(monkeypatch):
 
     with patch("backend.drift.azure_fetcher.DefaultAzureCredential"):
         with patch("backend.drift.azure_fetcher._fetch_subscription", return_value=primary_result):
-            with patch("backend.drift.azure_fetcher._get_resource_by_id", return_value=kv_result) as mock_get:
-                result = get_live_resources_multi(SUB_ID, cross_sub_state)
+            with patch("backend.drift.azure_fetcher._get_resource_by_id", return_value=(kv_result, None)) as mock_get:
+                live, warnings = get_live_resources_multi(SUB_ID, cross_sub_state)
 
     mock_get.assert_called_once_with(KV_ID.lower(), ANY)
-    assert len(result) == 2  # 1 primary + 1 cross-sub
+    assert len(live) == 2  # 1 primary + 1 cross-sub
+    assert warnings == []
 
 
 def test_multi_skips_cross_sub_already_in_primary(monkeypatch):
@@ -295,3 +297,87 @@ def test_multi_no_subscription_raises(monkeypatch):
     monkeypatch.delenv("AZURE_SUBSCRIPTION_ID", raising=False)
     with pytest.raises(ValueError, match="No subscription ID"):
         get_live_resources_multi(None, [])
+
+
+def test_multi_returns_tuple():
+    with patch("backend.drift.azure_fetcher.DefaultAzureCredential"):
+        with patch("backend.drift.azure_fetcher._fetch_subscription", return_value=[]):
+            result = get_live_resources_multi(SUB_ID, [])
+    live, warnings = result
+    assert isinstance(live, list)
+    assert isinstance(warnings, list)
+
+
+def test_failed_cross_sub_lookup_produces_warning():
+    """_get_resource_by_id failure surfaces a warning instead of silent None."""
+    state = [{"azure_id": KV_ID.lower(), "type": "azurerm_key_vault", "name": "my-vault"}]
+    with patch("backend.drift.azure_fetcher.DefaultAzureCredential"):
+        with patch("backend.drift.azure_fetcher._fetch_subscription", return_value=[]):
+            with patch(
+                "backend.drift.azure_fetcher._get_resource_by_id",
+                return_value=(None, "403 Forbidden"),
+            ):
+                live, warnings = get_live_resources_multi(SUB_ID, state)
+    assert len(warnings) == 1
+    assert KV_ID.lower() in warnings[0]
+    assert "403 Forbidden" in warnings[0]
+
+
+def test_failed_cross_sub_lookup_not_in_live_resources():
+    """A failed lookup does not appear in live resources (no silent None entry)."""
+    state = [{"azure_id": KV_ID.lower(), "type": "azurerm_key_vault"}]
+    with patch("backend.drift.azure_fetcher.DefaultAzureCredential"):
+        with patch("backend.drift.azure_fetcher._fetch_subscription", return_value=[]):
+            with patch(
+                "backend.drift.azure_fetcher._get_resource_by_id",
+                return_value=(None, "AuthorizationFailed"),
+            ):
+                live, warnings = get_live_resources_multi(SUB_ID, state)
+    assert all(r is not None for r in live)
+    assert not any(r.get("azure_id") == KV_ID.lower() for r in live)
+
+
+def test_successful_cross_sub_lookup_no_warning():
+    """A successful cross-sub lookup adds the resource and produces no warning."""
+    kv_item = _normalise_resource(_mock_resource(KV_ID, "my-vault", "Microsoft.KeyVault/vaults"))
+    state = [{"azure_id": KV_ID.lower(), "type": "azurerm_key_vault"}]
+    with patch("backend.drift.azure_fetcher.DefaultAzureCredential"):
+        with patch("backend.drift.azure_fetcher._fetch_subscription", return_value=[]):
+            with patch(
+                "backend.drift.azure_fetcher._get_resource_by_id",
+                return_value=(kv_item, None),
+            ):
+                live, warnings = get_live_resources_multi(SUB_ID, state)
+    assert warnings == []
+    assert any(r.get("azure_id") == KV_ID.lower() for r in live)
+
+
+# ── filter_unsupported_state_resources ────────────────────────────────────────
+
+def test_filter_unsupported_removes_role_assignments():
+    resources = [
+        {"type": "azurerm_storage_account", "azure_id": SA_ID.lower()},
+        {"type": "azurerm_role_assignment", "azure_id": "/subscriptions/x/roleAssignments/1"},
+        {"type": "azurerm_role_assignment", "azure_id": "/subscriptions/x/roleAssignments/2"},
+    ]
+    kept, removed = filter_unsupported_state_resources(resources)
+    assert len(kept) == 1
+    assert kept[0]["type"] == "azurerm_storage_account"
+    assert removed == {"azurerm_role_assignment": 2}
+
+
+def test_filter_unsupported_supported_types_unchanged():
+    resources = [
+        {"type": "azurerm_storage_account", "azure_id": SA_ID.lower()},
+        {"type": "azurerm_virtual_network", "azure_id": VNET_ID.lower()},
+        {"type": "azurerm_key_vault", "azure_id": KV_ID.lower()},
+    ]
+    kept, removed = filter_unsupported_state_resources(resources)
+    assert kept == resources
+    assert removed == {}
+
+
+def test_filter_unsupported_empty_list():
+    kept, removed = filter_unsupported_state_resources([])
+    assert kept == []
+    assert removed == {}

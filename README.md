@@ -211,6 +211,17 @@ Only attributes that Azure returns via the resource list API are compared — at
 
 ---
 
+## Known Limitations (v0.1.0)
+
+| Limitation | Details | Planned Fix |
+|------------|---------|-------------|
+| **Attribute comparison scope** | Only compares generic attributes: `location`, `tags`, `kind`, `sku`. Resource-specific config (NSG rules, Key Vault access policies, storage network rules, etc.) is not compared. | Resource-specific APIs in v0.2.0 |
+| **Role assignments not supported** | `azurerm_role_assignment` and `azurerm_role_definition` resources are excluded from drift checks with a warning — they are not returned by the Azure Resource Management API. | RBAC API support in v0.2.0 |
+| **Cross-subscription permissions** | Resources in secondary subscriptions are looked up individually by ID. If the lookup fails (e.g. insufficient permissions), the resource is skipped with a warning rather than reported as deleted. Ensure your credential has at least `Reader` on all subscriptions referenced in your state file. | — |
+| **Terraform state v3/v4 only** | State file versions below 3 are not supported. | — |
+
+---
+
 ## License
 
 [MIT](LICENSE)

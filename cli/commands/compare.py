@@ -18,7 +18,7 @@ from rich.padding import Padding
 from rich.panel import Panel
 
 from backend.drift.parser import load_state, extract_resources, StateParseError
-from backend.drift.azure_fetcher import get_live_resources_multi
+from backend.drift.azure_fetcher import get_live_resources_multi, filter_unsupported_state_resources
 from backend.drift.engine import detect_drift, DriftItem
 from backend.ai.triage import triage_available, triage_drift, TriageResult
 from backend.costs.azure_costs import get_current_spend, SubscriptionCost
@@ -129,10 +129,19 @@ def compare(
 
     state_resources = extract_resources(raw_state)
 
+    # Filter resource types the Azure Resource Management API cannot return.
+    # These would always appear as false "deleted" drift without this step.
+    state_resources, unsupported = filter_unsupported_state_resources(state_resources)
+    for tf_type, count in unsupported.items():
+        console.print(
+            f"[yellow]WARN[/yellow] {tf_type} ({count} resource{'s' if count != 1 else ''}) "
+            f"not supported in v0.1.0 — excluded from drift check (see README for details)"
+        )
+
     # ── 2. Fetch live Azure resources ─────────────────────────────────────────
     with console.status("[bold cyan]Fetching live resources from Azure...[/]"):
         try:
-            live_resources = get_live_resources_multi(subscription, state_resources)
+            live_resources, lookup_warnings = get_live_resources_multi(subscription, state_resources)
         except ValueError as exc:
             err.print(f"[ERROR] {exc}")
             raise typer.Exit(1)
@@ -143,6 +152,9 @@ def compare(
                 "are set, or that you are logged in with `az login`."
             )
             raise typer.Exit(1)
+
+    for warning in lookup_warnings:
+        console.print(f"[yellow]WARN[/yellow] {warning}")
 
     # ── 3. Detect drift ────────────────────────────────────────────────────────
     drift_items = detect_drift(state_resources, live_resources)

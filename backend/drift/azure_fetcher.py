@@ -285,19 +285,29 @@ def _resolve_api_version(
     if cache_key in _API_VERSION_CACHE:
         return _API_VERSION_CACHE[cache_key]
 
+    def _best_version(api_versions: list) -> str:
+        stable = [v for v in api_versions if "preview" not in v.lower()]
+        candidates = stable or api_versions
+        return sorted(candidates, reverse=True)[0] if candidates else _FALLBACK_API_VERSION
+
     try:
         provider = client.providers.get(namespace)
-        for rt in (provider.resource_types or []):
-            if rt.resource_type.lower() == resource_type.lower():
-                versions = [
-                    v for v in (rt.api_versions or [])
-                    if "preview" not in v.lower()
-                ]
-                if not versions:
-                    versions = rt.api_versions or []
-                version = sorted(versions, reverse=True)[0] if versions else _FALLBACK_API_VERSION
-                _API_VERSION_CACHE[cache_key] = version
-                return version
+        type_map = {rt.resource_type.lower(): rt for rt in (provider.resource_types or [])}
+
+        # Exact match first
+        if resource_type.lower() in type_map:
+            rt = type_map[resource_type.lower()]
+            version = _best_version(rt.api_versions or [])
+            _API_VERSION_CACHE[cache_key] = version
+            return version
+
+        # Child resource fallback: try parent type (e.g. "service/apis" → "service")
+        parent_type = resource_type.split("/")[0]
+        if parent_type.lower() != resource_type.lower() and parent_type.lower() in type_map:
+            rt = type_map[parent_type.lower()]
+            version = _best_version(rt.api_versions or [])
+            _API_VERSION_CACHE[cache_key] = version
+            return version
     except Exception:
         pass
 

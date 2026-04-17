@@ -18,6 +18,8 @@ from backend.drift.azure_fetcher import (
     _map_azure_type,
     _parse_subscription_id,
     _parse_provider_info,
+    _resolve_api_version,
+    _API_VERSION_CACHE,
 )
 
 SUB_ID = "12345678-1234-1234-1234-123456789abc"
@@ -381,3 +383,47 @@ def test_filter_unsupported_empty_list():
     kept, removed = filter_unsupported_state_resources([])
     assert kept == []
     assert removed == {}
+
+
+# ── _resolve_api_version child resource fallback ──────────────────────────────
+
+def _make_provider_client(type_version_map: dict) -> MagicMock:
+    """Build a mock client whose providers.get() returns the given type→version list."""
+    def _mock_rt(type_name, versions):
+        rt = MagicMock()
+        rt.resource_type = type_name
+        rt.api_versions = versions
+        return rt
+
+    provider = MagicMock()
+    provider.resource_types = [_mock_rt(t, v) for t, v in type_version_map.items()]
+    client = MagicMock()
+    client.providers.get.return_value = provider
+    return client
+
+
+def test_resolve_api_version_exact_match():
+    """Exact type match returns the latest stable version."""
+    _API_VERSION_CACHE.clear()
+    client = _make_provider_client({"service": ["2022-08-01", "2021-01-01-preview", "2020-12-01"]})
+    version = _resolve_api_version("Microsoft.ApiManagement", "service", client)
+    assert version == "2022-08-01"
+
+
+def test_resolve_api_version_child_falls_back_to_parent():
+    """Child type 'service/apis' not in provider — must use parent 'service' version, not hardcoded fallback."""
+    _API_VERSION_CACHE.clear()
+    client = _make_provider_client({"service": ["2022-08-01", "2020-12-01"]})
+    version = _resolve_api_version("Microsoft.ApiManagement", "service/apis", client)
+    assert version == "2022-08-01"
+
+
+def test_resolve_api_version_child_prefers_own_version_when_available():
+    """If 'service/apis' IS in provider types, use its own version."""
+    _API_VERSION_CACHE.clear()
+    client = _make_provider_client({
+        "service": ["2022-08-01"],
+        "service/apis": ["2023-05-01", "2022-08-01"],
+    })
+    version = _resolve_api_version("Microsoft.ApiManagement", "service/apis", client)
+    assert version == "2023-05-01"

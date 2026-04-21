@@ -25,6 +25,7 @@ from typing import Any
 from azure.identity import DefaultAzureCredential
 from azure.mgmt.network import NetworkManagementClient
 from azure.mgmt.resource import ResourceManagementClient
+from backend.drift.resource_graph import fetch_via_graph
 
 
 # Maps lowercase Azure API resource type → Terraform resource type.
@@ -174,7 +175,20 @@ def _fetch_subscription(
     subscription_id: str,
     credential: DefaultAzureCredential,
 ) -> list[dict[str, Any]]:
-    """Full list fetch for a single subscription (existing behaviour)."""
+    """
+    Fetch all resources in a subscription.
+
+    Tries Azure Resource Graph first — it returns all resource types including
+    child resources (subnets, NSG rules, APIM APIs, Key Vault secrets, etc.)
+    in a single query. Falls back to the ARM list API + explicit subnet fetch
+    if Resource Graph is unavailable or the credential lacks permissions.
+    """
+    try:
+        return fetch_via_graph(subscription_id, credential)
+    except Exception:
+        pass
+
+    # Fallback: ARM list API (misses child resources except subnets)
     client = ResourceManagementClient(credential, subscription_id)
     resources: list[dict[str, Any]] = []
 
@@ -188,7 +202,6 @@ def _fetch_subscription(
         if item:
             resources.append(item)
 
-    # Subnets are child resources of VNets and not returned by resources.list()
     resources.extend(_fetch_subnets(subscription_id, credential))
 
     return resources

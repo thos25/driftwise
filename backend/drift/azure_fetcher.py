@@ -23,6 +23,7 @@ import re
 from typing import Any
 
 from azure.identity import DefaultAzureCredential
+from azure.mgmt.network import NetworkManagementClient
 from azure.mgmt.resource import ResourceManagementClient
 
 
@@ -187,7 +188,42 @@ def _fetch_subscription(
         if item:
             resources.append(item)
 
+    # Subnets are child resources of VNets and not returned by resources.list()
+    resources.extend(_fetch_subnets(subscription_id, credential))
+
     return resources
+
+
+def _fetch_subnets(
+    subscription_id: str,
+    credential: DefaultAzureCredential,
+) -> list[dict[str, Any]]:
+    """
+    Fetch all subnets in a subscription via the Network API.
+
+    Subnets are child resources of VNets and are not returned by the generic
+    ResourceManagementClient.resources.list() call, causing them to appear as
+    deleted when they exist in Terraform state.
+    """
+    network_client = NetworkManagementClient(credential, subscription_id)
+    subnets: list[dict[str, Any]] = []
+
+    try:
+        for vnet in network_client.virtual_networks.list_all():
+            rg = _resource_group_from_id(getattr(vnet, "id", "") or "")
+            if not rg or not vnet.name:
+                continue
+            try:
+                for subnet in network_client.subnets.list(rg, vnet.name):
+                    item = _normalise_subnet(subnet)
+                    if item:
+                        subnets.append(item)
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return subnets
 
 
 def _get_resource_by_id(
@@ -268,6 +304,43 @@ def _parse_provider_info(resource_id: str) -> tuple[str, str] | None:
     resource_type = "/".join(type_parts)
 
     return (namespace, resource_type)
+
+
+def _resource_group_from_id(resource_id: str) -> str | None:
+    """Extract the resource group name from a resource ID."""
+    parts = resource_id.split("/")
+    try:
+        idx = next(i for i, p in enumerate(parts) if p.lower() == "resourcegroups")
+        return parts[idx + 1]
+    except (StopIteration, IndexError):
+        return None
+
+
+def _normalise_subnet(subnet) -> dict[str, Any] | None:
+    """Convert a Subnet SDK object to our normalised resource dict."""
+    azure_id: str = getattr(subnet, "id", None) or ""
+    if not azure_id:
+        return None
+
+    # Prefer address_prefixes (list); fall back to address_prefix (single string, older API)
+    address_prefixes = getattr(subnet, "address_prefixes", None)
+    if not address_prefixes:
+        single = getattr(subnet, "address_prefix", None)
+        address_prefixes = [single] if single else []
+
+    attributes: dict[str, Any] = {}
+    if address_prefixes:
+        attributes["address_prefixes"] = address_prefixes
+
+    return {
+        "type": "azurerm_subnet",
+        "name": getattr(subnet, "name", "") or "",
+        "module": "",
+        "provider_name": "azurerm",
+        "id": azure_id,
+        "azure_id": azure_id.lower(),
+        "attributes": attributes,
+    }
 
 
 def _resolve_api_version(

@@ -62,14 +62,16 @@ def detect_drift(
             )
 
     # Present in both — check for attribute changes.
-    # We compare the keys Azure *returned* (actual) against what TF state
-    # recorded.  Azure's generic list API gives fewer fields than TF state,
-    # so iterating expected keys would produce false positives for attributes
-    # we simply cannot observe via the resource list endpoint.
+    # Only check attributes that exist in BOTH state and live: we iterate live
+    # (actual) keys but skip any that Terraform didn't track.  This means:
+    #   - Azure-managed fields (auto-tags, ETags, system timestamps) not in TF
+    #     state are silently ignored → no false "modified" drift.
+    #   - TF-state fields that Azure's list API doesn't return are also ignored
+    #     → no false positives for attributes we can't observe.
     for rid in state_by_id.keys() & live_by_id.keys():
         expected = state_by_id[rid]["attributes"]
         actual = live_by_id[rid]["attributes"]
-        changed = [k for k in actual if actual.get(k) != expected.get(k)]
+        changed = [k for k in actual if k in expected and actual.get(k) != expected.get(k)]
         if changed:
             drift.append(
                 DriftItem(

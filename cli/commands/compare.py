@@ -18,10 +18,10 @@ from rich.padding import Padding
 from rich.panel import Panel
 
 from backend.drift.parser import load_state, extract_resources, StateParseError
-from backend.drift.azure_fetcher import get_live_resources_multi, filter_unsupported_state_resources
+from backend.drift.azure_fetcher import get_live_resources_multi, filter_unsupported_state_resources, LookupFailure
 from backend.drift.engine import detect_drift, DriftItem
 from backend.ai.triage import triage_available, triage_drift, TriageResult
-from backend.costs.azure_costs import get_current_spend, SubscriptionCost
+from backend.costs.azure_costs import get_spend_multi, SubscriptionCost
 from backend.ignore import load_ignore_file, rules_from_patterns, apply_ignores, IgnoreFileError
 from backend.remote.azure_blob import parse_backend_config, fetch_state, BackendConfigError, BlobFetchError
 
@@ -141,7 +141,7 @@ def compare(
     # ── 2. Fetch live Azure resources ─────────────────────────────────────────
     with console.status("[bold cyan]Fetching live resources from Azure...[/]"):
         try:
-            live_resources, lookup_warnings = get_live_resources_multi(subscription, state_resources)
+            live_resources, lookup_failures = get_live_resources_multi(subscription, state_resources)
         except ValueError as exc:
             err.print(f"[ERROR] {exc}")
             raise typer.Exit(1)
@@ -153,11 +153,13 @@ def compare(
             )
             raise typer.Exit(1)
 
-    for warning in lookup_warnings:
-        console.print(f"[yellow]WARN[/yellow] {warning}")
+    # Resources with failed cross-subscription lookups go into UNVERIFIABLE.
+    # They are excluded from drift detection so they never appear as "deleted".
+    unverifiable_ids = {f.azure_id for f in lookup_failures}
+    state_for_drift = [r for r in state_resources if r.get("azure_id") not in unverifiable_ids]
 
     # ── 3. Detect drift ────────────────────────────────────────────────────────
-    drift_items = detect_drift(state_resources, live_resources)
+    drift_items = detect_drift(state_for_drift, live_resources)
 
     # ── 4. Apply ignore rules ─────────────────────────────────────────────────
     ignore_rules = []
@@ -191,7 +193,8 @@ def compare(
     if costs:
         with console.status("[bold cyan]Fetching cost data from Azure...[/]"):
             try:
-                cost_data = get_current_spend(subscription)
+                all_ids = [r["azure_id"] for r in state_resources if r.get("azure_id")]
+                cost_data = get_spend_multi(all_ids, subscription)
             except ValueError as exc:
                 err.print(f"[ERROR] {exc}")
                 raise typer.Exit(1)
@@ -202,20 +205,21 @@ def compare(
 
     # ── 6. Output ─────────────────────────────────────────────────────────────
     if json_out:
-        _print_json(state_resources, live_resources, drift_items, triage_results, cost_data)
+        _print_json(state_for_drift, live_resources, drift_items, triage_results, cost_data, lookup_failures)
     else:
         drifted_ids = {d.resource_id for d in drift_items if d.drift_type in ("deleted", "modified")}
         clean_resources = [
-            r for r in state_resources
+            r for r in state_for_drift
             if r.get("azure_id") and r["azure_id"] not in drifted_ids
             and r["azure_id"] in {lr["azure_id"] for lr in live_resources if lr.get("azure_id")}
         ]
         _print_report(
             state_label, subscription,
-            state_resources, live_resources,
+            state_for_drift, live_resources,
             drift_items, triage_results, cost_data,
             clean_resources=clean_resources if show_all else [],
             suppressed=suppressed,
+            lookup_failures=lookup_failures,
         )
 
     # Exit 2 when drift found — lets CI pipelines gate on this cleanly
@@ -235,7 +239,9 @@ def _print_report(
     cost_data: Optional[SubscriptionCost] = None,
     clean_resources: list | None = None,
     suppressed: int = 0,
+    lookup_failures: list[LookupFailure] | None = None,
 ) -> None:
+    lookup_failures = lookup_failures or []
     deleted  = [d for d in drift_items if d.drift_type == "deleted"]
     added    = [d for d in drift_items if d.drift_type == "added"]
     modified = [d for d in drift_items if d.drift_type == "modified"]
@@ -249,6 +255,8 @@ def _print_report(
     if subscription:
         console.print(f"  [dim]Subscription :[/]  {subscription}")
     console.print(f"  [dim]Resources    :[/]  {len(state_resources)} in state · {len(live_resources)} live")
+    if lookup_failures:
+        console.print(f"  [dim]Unverifiable :[/]  {len(lookup_failures)} (cross-subscription lookup failed)")
     if cost_data is not None:
         console.print(
             f"  [dim]Cost (MTD)   :[/]  "
@@ -257,7 +265,7 @@ def _print_report(
         )
     console.print()
 
-    if not drift_items:
+    if not drift_items and not lookup_failures:
         console.print("  [bold green]✓ All resources match — no drift detected.[/]")
         console.print()
         return
@@ -271,6 +279,8 @@ def _print_report(
         console.print(f"  [yellow]~  {len(modified)} modified[/]")
     if added:
         console.print(f"  [blue]+  {len(added)} added[/]  [dim](in Azure, not in state)[/]")
+    if lookup_failures:
+        console.print(f"  [dim]?  {len(lookup_failures)} unverifiable[/]  [dim](cross-subscription lookup failed)[/]")
     console.print()
 
     # Per-item detail sections
@@ -282,6 +292,8 @@ def _print_report(
         _print_section("Modified", modified, "~", "yellow", triage_results, cost_data)
     if added:
         _print_section("Added", added, "+", "blue", triage_results, cost_data)
+    if lookup_failures:
+        _print_unverifiable_section(lookup_failures)
 
     # Suppression notice
     if suppressed:
@@ -313,6 +325,20 @@ def _print_clean_section(
                 cost_str = f"  [dim]{item_cost:,.2f} {cost_data.currency} MTD[/]"
         console.print(f"  [green]✓[/]  [bold]{r.get('type', '')}[/]  \"{r.get('name', '')}\"{cost_str}")
         console.print(f"     [dim]{_shorten_id(rid)}[/]")
+        console.print()
+    console.print()
+
+
+def _print_unverifiable_section(failures: list[LookupFailure]) -> None:
+    console.rule("[bold dim]Unverifiable[/]", style="dim")
+    console.print()
+    for f in failures:
+        sub_match = f.azure_id.split("/")
+        sub_id = sub_match[2] if len(sub_match) > 2 else "unknown"
+        console.print(f"  [dim]?[/]  [bold]{f.resource_type}[/]  \"{f.resource_name}\"")
+        console.print(f"     [dim]subscription: {sub_id}[/]")
+        console.print(f"     [dim]reason: {f.error}[/]")
+        console.print(f"     [dim]{_shorten_id(f.azure_id)}[/]")
         console.print()
     console.print()
 
@@ -379,11 +405,14 @@ def _print_json(
     drift_items: list[DriftItem],
     triage_results: dict[str, TriageResult],
     cost_data: Optional[SubscriptionCost] = None,
+    lookup_failures: list[LookupFailure] | None = None,
 ) -> None:
+    lookup_failures = lookup_failures or []
     output: dict = {
         "state_count": len(state_resources),
         "live_count": len(live_resources),
         "drift_count": len(drift_items),
+        "unverifiable_count": len(lookup_failures),
         "drift": [
             {
                 "type": d.drift_type,
@@ -397,6 +426,16 @@ def _print_json(
             for d in drift_items
         ],
     }
+    if lookup_failures:
+        output["unverifiable"] = [
+            {
+                "resource_type": f.resource_type,
+                "resource_name": f.resource_name,
+                "azure_id": f.azure_id,
+                "reason": f.error,
+            }
+            for f in lookup_failures
+        ]
     if cost_data is not None:
         output["costs"] = {
             "billing_period": cost_data.billing_period,

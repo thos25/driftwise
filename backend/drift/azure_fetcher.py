@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import os
 import re
+from dataclasses import dataclass
 from typing import Any
 
 from azure.identity import DefaultAzureCredential
@@ -53,6 +54,15 @@ _AZURE_TO_TF_TYPE: dict[str, str] = {
     "microsoft.insights/components": "azurerm_application_insights",
     "microsoft.operationalinsights/workspaces": "azurerm_log_analytics_workspace",
 }
+
+
+@dataclass
+class LookupFailure:
+    """A cross-subscription resource lookup that could not be verified."""
+    azure_id: str
+    resource_type: str
+    resource_name: str
+    error: str
 
 
 # Resource types in Terraform that are not returned by the generic Resource
@@ -94,7 +104,7 @@ def get_live_resources(subscription_id: str | None = None) -> list[dict[str, Any
 def get_live_resources_multi(
     primary_subscription: str | None,
     state_resources: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], list[str]]:
+) -> tuple[list[dict[str, Any]], list[LookupFailure]]:
     """
     Fetch live resources, handling cross-subscription state automatically.
 
@@ -109,9 +119,10 @@ def get_live_resources_multi(
             discover cross-subscription resource IDs.
 
     Returns:
-        Tuple of (live_resources, warnings). Warnings are emitted when a
-        cross-subscription lookup fails — the resource is skipped rather than
-        silently treated as deleted drift.
+        Tuple of (live_resources, lookup_failures). A LookupFailure is emitted
+        when a cross-subscription lookup fails — the resource is excluded from
+        drift detection and shown as UNVERIFIABLE in the report instead of
+        being silently treated as deleted drift.
     """
     primary_sub = primary_subscription or os.getenv("AZURE_SUBSCRIPTION_ID")
     if not primary_sub:
@@ -124,20 +135,20 @@ def get_live_resources_multi(
 
     # Full fetch for the primary subscription
     live: list[dict[str, Any]] = _fetch_subscription(primary_sub, credential)
-    warnings: list[str] = []
+    failures: list[LookupFailure] = []
 
-    # Find any state resource IDs that belong to a different subscription
+    # Find any state resources whose IDs belong to a different subscription
     primary_lower = primary_sub.lower()
-    cross_sub_ids = [
-        r["azure_id"]
-        for r in state_resources
+    cross_sub_resources = [
+        r for r in state_resources
         if r.get("azure_id")
         and _parse_subscription_id(r["azure_id"]) not in (None, primary_lower)
     ]
 
-    if cross_sub_ids:
+    if cross_sub_resources:
         seen: set[str] = {r["azure_id"] for r in live}
-        for resource_id in cross_sub_ids:
+        for resource in cross_sub_resources:
+            resource_id = resource["azure_id"]
             if resource_id in seen:
                 continue
             item, error = _get_resource_by_id(resource_id, credential)
@@ -145,11 +156,14 @@ def get_live_resources_multi(
                 live.append(item)
                 seen.add(resource_id)
             elif error:
-                warnings.append(
-                    f"Cross-subscription lookup failed for {resource_id}: {error} — skipped (resource excluded from drift check)"
-                )
+                failures.append(LookupFailure(
+                    azure_id=resource_id,
+                    resource_type=resource.get("type", ""),
+                    resource_name=resource.get("name", ""),
+                    error=error,
+                ))
 
-    return live, warnings
+    return live, failures
 
 
 def filter_unsupported_state_resources(

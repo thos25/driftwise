@@ -15,6 +15,7 @@ from backend.costs.azure_costs import (
     SubscriptionCost,
     _parse_query_result,
     get_current_spend,
+    get_spend_multi,
 )
 
 SUB = "00000000-1111-2222-3333-444444444444"
@@ -177,3 +178,75 @@ class TestGetCurrentSpend:
         call_kwargs = mock_client.query.usage.call_args
         scope = call_kwargs[1].get("scope") or call_kwargs[0][0]
         assert scope == f"/subscriptions/{SUB}"
+
+
+# ── get_spend_multi ───────────────────────────────────────────────────────────
+
+OTHER_SUB = "ffffffff-eeee-dddd-cccc-bbbbbbbbbbbb"
+OTHER_RID = f"/subscriptions/{OTHER_SUB}/resourceGroups/shared-rg/providers/Microsoft.KeyVault/vaults/my-vault"
+PRIMARY_RID = f"/subscriptions/{SUB}/resourceGroups/{RG}/providers/Microsoft.Storage/storageAccounts/sa1"
+
+
+class TestGetSpendMulti:
+    def _make_spend(self, sub_id: str, rid: str, cost: float) -> SubscriptionCost:
+        entry = CostEntry(rid, "microsoft.storage/storageaccounts", RG, cost, "USD")
+        return SubscriptionCost(sub_id, PERIOD, round(cost, 4), "USD", [entry])
+
+    def test_raises_when_no_subscription(self, monkeypatch):
+        monkeypatch.delenv("AZURE_SUBSCRIPTION_ID", raising=False)
+        with pytest.raises(ValueError, match="No subscription ID"):
+            get_spend_multi([])
+
+    def test_single_sub_delegates_to_get_current_spend(self, monkeypatch):
+        monkeypatch.setenv("AZURE_SUBSCRIPTION_ID", SUB)
+        primary_spend = self._make_spend(SUB, PRIMARY_RID, 10.0)
+        with patch("backend.costs.azure_costs.get_current_spend", return_value=primary_spend) as mock_fn:
+            result = get_spend_multi([PRIMARY_RID], SUB)
+        mock_fn.assert_called_once_with(SUB.lower())
+        assert result.total == 10.0
+        assert len(result.entries) == 1
+
+    def test_cross_sub_queries_both_subscriptions(self, monkeypatch):
+        monkeypatch.setenv("AZURE_SUBSCRIPTION_ID", SUB)
+        primary_spend = self._make_spend(SUB, PRIMARY_RID, 10.0)
+        other_spend = self._make_spend(OTHER_SUB, OTHER_RID, 25.0)
+
+        def _mock_spend(sub_id):
+            if sub_id == SUB.lower():
+                return primary_spend
+            return other_spend
+
+        with patch("backend.costs.azure_costs.get_current_spend", side_effect=_mock_spend):
+            result = get_spend_multi([PRIMARY_RID, OTHER_RID], SUB)
+
+        assert result.total == 35.0
+        assert len(result.entries) == 2
+        assert result.entries[0].cost == 25.0  # sorted descending
+
+    def test_failed_cross_sub_query_is_non_fatal(self, monkeypatch):
+        """A Cost Management error for one sub silently skips it."""
+        monkeypatch.setenv("AZURE_SUBSCRIPTION_ID", SUB)
+        primary_spend = self._make_spend(SUB, PRIMARY_RID, 10.0)
+
+        def _mock_spend(sub_id):
+            if sub_id == SUB.lower():
+                return primary_spend
+            raise Exception("AuthorizationFailed")
+
+        with patch("backend.costs.azure_costs.get_current_spend", side_effect=_mock_spend):
+            result = get_spend_multi([PRIMARY_RID, OTHER_RID], SUB)
+
+        assert result.total == 10.0
+        assert len(result.entries) == 1
+
+    def test_deduplicates_subscription_ids(self, monkeypatch):
+        """Duplicate subscription IDs in resource list → only one query per sub."""
+        monkeypatch.setenv("AZURE_SUBSCRIPTION_ID", SUB)
+        primary_spend = self._make_spend(SUB, PRIMARY_RID, 5.0)
+        rid2 = f"/subscriptions/{SUB}/resourceGroups/{RG}/providers/Microsoft.Network/virtualNetworks/vnet1"
+
+        with patch("backend.costs.azure_costs.get_current_spend", return_value=primary_spend) as mock_fn:
+            get_spend_multi([PRIMARY_RID, rid2], SUB)
+
+        # Both resource IDs belong to the same sub — only one Cost Management call
+        assert mock_fn.call_count == 1

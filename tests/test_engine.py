@@ -73,6 +73,16 @@ def test_no_false_positive_for_extra_state_attrs():
     assert drift == []
 
 
+def test_no_false_positive_for_extra_live_attrs():
+    """Azure-managed fields not tracked in TF state must not cause false 'modified'."""
+    rid = f"{SUB}/resourceGroups/rg-a"
+    state = [_res(rid, attrs={"location": "eastus", "tags": {}})]
+    # Azure returns extra auto-managed fields not present in state
+    live = [_res(rid, attrs={"location": "eastus", "tags": {}, "etag": "abc123", "auto_tag": "managed"})]
+    drift = detect_drift(state, live)
+    assert drift == []
+
+
 def test_modified_shows_correct_changed_fields():
     rid = f"{SUB}/resourceGroups/rg-a"
     state = [_res(rid, attrs={"location": "eastus", "tags": {"env": "dev"}})]

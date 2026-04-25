@@ -13,9 +13,12 @@ Usage:
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Any
+
+_SUB_RE = re.compile(r"^/subscriptions/([^/]+)", re.IGNORECASE)
 
 from azure.identity import DefaultAzureCredential
 from azure.mgmt.costmanagement import CostManagementClient
@@ -104,6 +107,68 @@ def get_current_spend(subscription_id: str | None = None) -> SubscriptionCost:
 
     result = client.query.usage(scope=scope, parameters=query)
     return _parse_query_result(sub_id, billing_period, result)
+
+
+def get_spend_multi(
+    resource_ids: list[str],
+    primary_subscription: str | None = None,
+) -> SubscriptionCost:
+    """
+    Fetch MTD spend for all unique subscriptions referenced in resource_ids.
+
+    Groups resource IDs by subscription (parsed from each ID's path),
+    fires one Cost Management query per unique subscription, and merges
+    all entries into a single SubscriptionCost. This ensures cost data
+    is populated for cross-subscription resources, not just the primary sub.
+
+    Args:
+        resource_ids: Azure resource IDs whose subscriptions should be queried.
+        primary_subscription: the primary subscription ID. Falls back to the
+            AZURE_SUBSCRIPTION_ID environment variable if not provided.
+
+    Returns:
+        A merged SubscriptionCost covering all reachable subscriptions.
+        Subscriptions whose Cost Management queries fail are silently skipped —
+        cost data is best-effort and its absence never aborts the report.
+
+    Raises:
+        ValueError: if no primary subscription ID can be resolved.
+    """
+    primary_sub = primary_subscription or os.getenv("AZURE_SUBSCRIPTION_ID")
+    if not primary_sub:
+        raise ValueError(
+            "No subscription ID provided. "
+            "Pass one explicitly or set the AZURE_SUBSCRIPTION_ID environment variable."
+        )
+
+    # Collect unique subscription IDs from resource IDs (always include primary)
+    sub_ids: set[str] = {primary_sub.lower()}
+    for rid in resource_ids:
+        m = _SUB_RE.match(rid)
+        if m:
+            sub_ids.add(m.group(1).lower())
+
+    billing_period = date.today().strftime("%Y-%m")
+    all_entries: list[CostEntry] = []
+    currency = "USD"
+
+    for sub_id in sub_ids:
+        try:
+            result = get_current_spend(sub_id)
+            all_entries.extend(result.entries)
+            if result.entries:
+                currency = result.currency
+        except Exception:
+            pass  # non-fatal — missing cost data for one sub never aborts the report
+
+    total = sum(e.cost for e in all_entries)
+    return SubscriptionCost(
+        subscription_id=primary_sub,
+        billing_period=billing_period,
+        total=round(total, 4),
+        currency=currency,
+        entries=sorted(all_entries, key=lambda e: e.cost, reverse=True),
+    )
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
